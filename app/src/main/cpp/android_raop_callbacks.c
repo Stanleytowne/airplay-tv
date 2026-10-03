@@ -42,9 +42,7 @@ void android_callbacks_init(android_callback_ctx_t *ctx, JNIEnv *env, jobject ca
     ctx->callback_obj = (*env)->NewGlobalRef(env, callback_obj);
     ctx->h265_enabled = 1;
     ctx->require_pin = 0;
-    ctx->registered_count = 0;
     ctx->audio_engine = NULL;
-    memset(ctx->registered_keys, 0, sizeof(ctx->registered_keys));
 
     pthread_mutex_init(&ctx->playback_info_lock, NULL);
     ctx->playback_position = 0.0;
@@ -64,6 +62,8 @@ void android_callbacks_init(android_callback_ctx_t *ctx, JNIEnv *env, jobject ca
     ctx->on_conn_destroy = (*env)->GetMethodID(env, cls, "onConnectionDestroy", "()V");
     ctx->on_conn_reset = (*env)->GetMethodID(env, cls, "onConnectionReset", "(I)V");
     ctx->on_display_pin = (*env)->GetMethodID(env, cls, "onDisplayPin", "(Ljava/lang/String;)V");
+    ctx->on_register_client = (*env)->GetMethodID(env, cls, "onRegisterClient", "(Ljava/lang/String;)V");
+    ctx->on_check_client = (*env)->GetMethodID(env, cls, "onCheckClient", "(Ljava/lang/String;)Z");
     ctx->on_metadata = (*env)->GetMethodID(env, cls, "onMetadata", "([B)V");
     ctx->on_coverart = (*env)->GetMethodID(env, cls, "onCoverArt", "([B)V");
     ctx->on_progress = (*env)->GetMethodID(env, cls, "onProgress", "(JJJ)V");
@@ -82,11 +82,6 @@ void android_callbacks_destroy(android_callback_ctx_t *ctx, JNIEnv *env) {
         (*env)->DeleteGlobalRef(env, ctx->callback_obj);
         ctx->callback_obj = NULL;
     }
-    for (int i = 0; i < ctx->registered_count; i++) {
-        free(ctx->registered_keys[i]);
-        ctx->registered_keys[i] = NULL;
-    }
-    ctx->registered_count = 0;
     pthread_mutex_destroy(&ctx->playback_info_lock);
 }
 
@@ -283,27 +278,31 @@ static void _mirror_video_running(void *cls, bool running) {
 static void _register_client(void *cls, const char *device_id, const char *pk_str, const char *name) {
     android_callback_ctx_t *ctx = (android_callback_ctx_t *)cls;
     (void)device_id; (void)name;
-    if (ctx->registered_count >= 16) return;
-    for (int i = 0; i < ctx->registered_count; i++) {
-        if (ctx->registered_keys[i] && strcmp(ctx->registered_keys[i], pk_str) == 0) return;
-    }
-    ctx->registered_keys[ctx->registered_count++] = strdup(pk_str);
-    LOGI("registered client pk (slot %d)", ctx->registered_count);
+    JNIEnv *env = _get_env(ctx);
+    if (!env || !pk_str) return;
+    jstring key = (*env)->NewStringUTF(env, pk_str);
+    if (!key) return;
+    (*env)->CallVoidMethod(env, ctx->callback_obj, ctx->on_register_client, key);
+    (*env)->DeleteLocalRef(env, key);
 }
 
 static bool _check_register(void *cls, const char *pk_str) {
     android_callback_ctx_t *ctx = (android_callback_ctx_t *)cls;
-    for (int i = 0; i < ctx->registered_count; i++) {
-        if (ctx->registered_keys[i] && strcmp(ctx->registered_keys[i], pk_str) == 0) return true;
-    }
-    return false;
+    JNIEnv *env = _get_env(ctx);
+    if (!env || !pk_str) return false;
+    jstring key = (*env)->NewStringUTF(env, pk_str);
+    if (!key) return false;
+    jboolean trusted = (*env)->CallBooleanMethod(env, ctx->callback_obj, ctx->on_check_client, key);
+    bool failed = (*env)->ExceptionCheck(env);
+    (*env)->DeleteLocalRef(env, key);
+    return !failed && trusted == JNI_TRUE;
 }
 
 /* --- AirPlay Video (HLS) playback callbacks --- */
 
 static void _video_play(void *cls, const char *location, const float start_position) {
     android_callback_ctx_t *ctx = (android_callback_ctx_t *)cls;
-    LOGI("video_play: %s @ %.2fs", location ? location : "(null)", start_position);
+    LOGI("video_play requested");
     android_callbacks_update_playback_info(ctx, start_position, 0.0, 1.0f, 1);
     JNIEnv *env = _get_env(ctx);
     if (!env || !location) return;

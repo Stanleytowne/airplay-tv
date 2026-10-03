@@ -46,6 +46,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isHudVisible = false
     private var currentPort = 7000
+    private var dismissingPinWithBack = false
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -176,6 +177,15 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
             binding.switchPin.isChecked = newState
             prefs.edit().putBoolean(Prefs.REQUIRE_PIN, newState).apply()
             airPlayService?.restartServer()
+        }
+        binding.buttonForgetDevices.setOnClickListener {
+            androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle(R.string.forget_devices)
+                .setMessage(R.string.forget_devices_message)
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton(android.R.string.ok) { _, _ ->
+                    airPlayService?.forgetPairedDevices()
+                }.show()
         }
     }
 
@@ -312,6 +322,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
                         binding.pinOverlay.visibility = View.VISIBLE
                     } else {
                         binding.pinOverlay.visibility = View.GONE
+                        binding.tvPinCode.text = ""
                     }
                 }
             }
@@ -445,7 +456,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         val aRenderer = service.audioRenderer
         val audioDbg = aRenderer.audioDebug()
 
-        val videoStats = "${vRenderer.codecName} | ${vRenderer.fps} fps | ${"%.1f".format((vRenderer.bitrateBps / 1000.0) / 1000.0)} Mbps | Drops: ${vRenderer.droppedFrames}"
+        val videoStats = "${vRenderer.codecName} | 输出 ${vRenderer.fps} / 接收 ${vRenderer.receivedFps} fps | ${"%.1f".format((vRenderer.bitrateBps / 1000.0) / 1000.0)} Mbps | 抖动 ${vRenderer.framePacingJitterUs / 1000} ms"
         val audioStats = if (audioDbg != null) {
             "Audio: ${aRenderer.codecLabel} | Cushion: ${audioDbg.tunedCushionMs}ms | XRuns: ${audioDbg.xrun} | Underruns: ${audioDbg.underruns}"
         } else {
@@ -465,6 +476,26 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         airPlayService?.videoRenderer?.clearSurface(holder.surface)
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val isBack = event.keyCode == KeyEvent.KEYCODE_BACK || event.keyCode == KeyEvent.KEYCODE_ESCAPE
+        if (isBack && (dismissingPinWithBack || binding.pinOverlay.visibility == View.VISIBLE)) {
+            // Consume the entire press before a focused player/settings view handles it.
+            // In particular, the key-up must not exit the activity after hiding the PIN.
+            if (event.action == KeyEvent.ACTION_DOWN) {
+                dismissingPinWithBack = true
+                if (event.repeatCount == 0) {
+                    binding.pinOverlay.visibility = View.GONE
+                    binding.tvPinCode.text = ""
+                    airPlayService?.dismissPinPrompt()
+                }
+            } else if (event.action == KeyEvent.ACTION_UP) {
+                dismissingPinWithBack = false
+            }
+            return true
+        }
+        return super.dispatchKeyEvent(event)
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {

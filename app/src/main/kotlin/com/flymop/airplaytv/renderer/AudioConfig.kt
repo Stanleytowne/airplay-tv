@@ -6,8 +6,8 @@ package com.flymop.airplaytv.renderer
  */
 data class AudioConfig(
     val cushionMs: Int = 0,           // 0 = adaptive tuner, otherwise fixed cushion ms
-    val percentilePct: Int = 95,
-    val oboeBufferFrames: Int = 0,    // 0 = auto (two bursts)
+    val percentilePct: Int = 99,
+    val oboeBufferFrames: Int = 0,    // 0 = auto (adaptive, starts at three bursts)
     val forceSwAlac: Boolean = false,
     val realtimePriority: Boolean = true,
     val lowLatency: Boolean = true,

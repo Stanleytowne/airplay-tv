@@ -22,12 +22,31 @@ class AudioOutput;
 class OboeCallbacks : public oboe::AudioStreamDataCallback,
                       public oboe::AudioStreamErrorCallback {
 public:
-    OboeCallbacks(std::shared_ptr<TimelineBuffer> timeline, std::shared_ptr<LogSink> log)
-        : mTimeline(std::move(timeline)), mLog(std::move(log)) {}
+    OboeCallbacks(std::shared_ptr<TimelineBuffer> timeline, std::shared_ptr<LogSink> log,
+                  bool autoBuffer)
+        : mTimeline(std::move(timeline)), mLog(std::move(log)), mAutoBuffer(autoBuffer) {}
 
-    oboe::DataCallbackResult onAudioReady(oboe::AudioStream *, void *audioData,
+    oboe::DataCallbackResult onAudioReady(oboe::AudioStream *stream, void *audioData,
                                           int32_t numFrames) override {
         mTimeline->read(static_cast<int16_t *>(audioData), numFrames);
+        // Network cushion and hardware callback underruns are different problems.
+        // Grow only the automatic AAudio output buffer when the device misses a deadline.
+        if (mAutoBuffer && stream->getAudioApi() == oboe::AudioApi::AAudio) {
+            auto count = stream->getXRunCount();
+            if (count) {
+                const int previous = mLastXrun.exchange(count.value(), std::memory_order_relaxed);
+                if (count.value() > previous) {
+                    const int current = stream->getBufferSizeInFrames();
+                    const int limit = std::min(stream->getBufferCapacityInFrames(),
+                                               std::max(current, stream->getSampleRate() / 10));
+                    const int target = std::min(limit, current + stream->getFramesPerBurst());
+                    if (target > current) {
+                        auto size = stream->setBufferSizeInFrames(target);
+                        if (size) mTimeline->noteOutputBufferFrames(size.value());
+                    }
+                }
+            }
+        }
         return oboe::DataCallbackResult::Continue;
     }
 
@@ -39,6 +58,8 @@ private:
     std::shared_ptr<TimelineBuffer> mTimeline;
     std::shared_ptr<LogSink> mLog;
     std::weak_ptr<AudioOutput> mOwner;
+    const bool mAutoBuffer;
+    std::atomic<int32_t> mLastXrun{0};
 };
 
 /*
@@ -61,7 +82,8 @@ public:
                 std::shared_ptr<TimelineBuffer> timeline, std::shared_ptr<LogSink> log)
         : mSampleRate(sampleRate), mChannels(channels), mOboeBufferFrames(oboeBufferFrames),
           mLowLatency(lowLatency), mTimeline(std::move(timeline)), mLog(std::move(log)),
-          mCallbacks(std::make_shared<OboeCallbacks>(mTimeline, mLog)) {}
+          mCallbacks(std::make_shared<OboeCallbacks>(mTimeline, mLog,
+                                                     lowLatency && oboeBufferFrames == 0)) {}
 
     ~AudioOutput() { stop(); }
 
@@ -139,8 +161,8 @@ private:
         if (mOboeBufferFrames > 0) {
             mStream->setBufferSizeInFrames(mOboeBufferFrames);
         } else if (mLowLatency) {
-            // smallest reasonable buffer in low-latency mode
-            mStream->setBufferSizeInFrames(mStream->getFramesPerBurst() * 2);
+            // One extra burst gives older TV schedulers headroom; callback tunes upward on xruns.
+            mStream->setBufferSizeInFrames(mStream->getFramesPerBurst() * 3);
         }
 
         // log what we actually got: oboe may clamp the buffer, fall back to a

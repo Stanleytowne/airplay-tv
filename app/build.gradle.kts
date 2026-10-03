@@ -1,7 +1,17 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+
+val releaseKeys = Properties().apply {
+    System.getenv("AIRPLAY_SIGNING_PROPERTIES")?.let { path ->
+        file(path).inputStream().use { load(it) }
+    }
+}
+val targetAbis = providers.gradleProperty("airplayAbis")
+    .orElse("armeabi-v7a,arm64-v8a,x86_64").get().split(",")
 
 android {
     namespace = "com.flymop.airplaytv"
@@ -9,11 +19,11 @@ android {
     ndkVersion = "27.0.12077973"
 
     defaultConfig {
-        applicationId = "com.flymop.airplaytv"
+        applicationId = "com.flymop.airplaytv.home"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 10
+        versionName = "1.1.8-home"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -27,14 +37,25 @@ android {
         }
 
         ndk {
-            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a", "x86_64"))
+            abiFilters.addAll(targetAbis)
+        }
+    }
+
+    signingConfigs {
+        if (releaseKeys.isNotEmpty()) {
+            create("homeRelease") {
+                storeFile = file(releaseKeys.getProperty("storeFile"))
+                storePassword = releaseKeys.getProperty("storePassword")
+                keyAlias = releaseKeys.getProperty("keyAlias")
+                keyPassword = releaseKeys.getProperty("keyPassword")
+            }
         }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("homeRelease")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -50,7 +71,7 @@ android {
         abi {
             isEnable = true
             reset()
-            include("armeabi-v7a", "arm64-v8a", "x86_64")
+            include(*targetAbis.toTypedArray())
             isUniversalApk = true
         }
     }
@@ -108,9 +129,9 @@ tasks.register("applyUxplayPatches") {
             patches.forEach { patch ->
                 val checkProc = ProcessBuilder("git", "-C", uxplayDir.absolutePath, "apply", "--check", "--unidiff-zero", patch.absolutePath)
                     .redirectErrorStream(true).start()
-                if (checkProc.waitFor() == 0) {
-                    git("apply", "--unidiff-zero", patch.absolutePath)
-                }
+                val checkOutput = checkProc.inputStream.bufferedReader().readText()
+                check(checkProc.waitFor() == 0) { "Required patch ${patch.name} failed:\n$checkOutput" }
+                git("apply", "--unidiff-zero", patch.absolutePath)
             }
         }
     }
@@ -118,6 +139,11 @@ tasks.register("applyUxplayPatches") {
 
 tasks.configureEach {
     if (name.startsWith("configureCMake")) dependsOn("applyUxplayPatches")
+    if (name == "preReleaseBuild") doFirst {
+        check(releaseKeys.isNotEmpty()) {
+            "Set AIRPLAY_SIGNING_PROPERTIES to your private signing properties file before building a release."
+        }
+    }
 }
 
 dependencies {

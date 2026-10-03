@@ -1,6 +1,9 @@
 package com.flymop.airplaytv.renderer
 
 import android.graphics.SurfaceTexture
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Process
 import android.opengl.EGL14
 import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
@@ -16,6 +19,9 @@ import java.nio.FloatBuffer
 // gl thread blits it to any surface attached, so fullscreen toggles re-point display without restarting codec
 class VideoPipeline {
 
+    internal val renderStats = RenderStats()
+    private var frameEvents: HandlerThread? = null
+    private var lastTextureTimestamp = Long.MIN_VALUE
     private val lock = Object()
     private var thread: Thread? = null
     @Volatile private var running = false
@@ -30,9 +36,11 @@ class VideoPipeline {
     private var aPos = 0
     private var aTex = 0
     private var uTexMatrix = 0
+    private var uTexBounds = 0
     private var posVbo = 0
     private var texVbo = 0
     private val texMatrix = FloatArray(16)
+    private val texBounds = FloatArray(4)
     private var hasFrame = false
 
     private var surfaceTexture: SurfaceTexture? = null
@@ -43,6 +51,8 @@ class VideoPipeline {
     private var displayDirty = false
     @Volatile private var videoW = 0
     @Volatile private var videoH = 0
+    @Volatile private var decodedW = 0
+    @Volatile private var decodedH = 0
 
     fun start() = synchronized(lock) {
         if (running) return@synchronized
@@ -61,6 +71,11 @@ class VideoPipeline {
         videoW = w
         videoH = h
         surfaceTexture?.setDefaultBufferSize(w, h)
+    }
+
+    fun setDecodedSize(w: Int, h: Int) {
+        decodedW = w
+        decodedH = h
     }
 
     fun release() {
@@ -83,6 +98,10 @@ class VideoPipeline {
             synchronized(lock) { running = false; lock.notifyAll() }
             return
         }
+        frameEvents = HandlerThread("VideoFrameEvents", Process.THREAD_PRIORITY_DISPLAY).also { it.start() }
+        surfaceTexture?.setOnFrameAvailableListener({
+            synchronized(lock) { frameAvailable = true; lock.notifyAll() }
+        }, Handler(frameEvents!!.looper))
         Matrix.setIdentityM(texMatrix, 0)
         synchronized(lock) {
             inputSurface = Surface(surfaceTexture)
@@ -138,6 +157,7 @@ class VideoPipeline {
             // no display: keep consuming so decoder doesn't stall
             egl.makeCurrent()
             st.updateTexImage()
+            st.getTransformMatrix(texMatrix)
             hasFrame = true
             return
         }
@@ -145,15 +165,29 @@ class VideoPipeline {
         st.updateTexImage()
         st.getTransformMatrix(texMatrix)
         hasFrame = true
-        _render()
+        val timestamp = st.timestamp
+        if (timestamp == lastTextureTimestamp) return
+        lastTextureTimestamp = timestamp
+        if (_render()) renderStats.record(System.nanoTime())
     }
 
-    private fun _render() {
+    private fun _render(): Boolean {
+        val egl = egl ?: return false
+        // A Surface can resize after EGLSurface creation, including between portrait and landscape.
+        winW = egl.query(window, EGL14.EGL_WIDTH)
+        winH = egl.query(window, EGL14.EGL_HEIGHT)
+        if (winW <= 0 || winH <= 0) return false
         GLES20.glViewport(0, 0, winW, winH)
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         GLES20.glUseProgram(program)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTex)
         GLES20.glUniformMatrix4fv(uTexMatrix, 1, false, texMatrix, 0)
+        TextureBounds.update(texMatrix, decodedW.takeIf { it > 0 } ?: videoW,
+            decodedH.takeIf { it > 0 } ?: videoH, texBounds)
+        GLES20.glUniform4fv(uTexBounds, 1, texBounds, 0)
 
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, posVbo)
         GLES20.glEnableVertexAttribArray(aPos)
@@ -168,7 +202,7 @@ class VideoPipeline {
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
         GLES20.glDisableVertexAttribArray(aPos)
         GLES20.glDisableVertexAttribArray(aTex)
-        egl?.swap(window)
+        return egl.swap(window)
     }
 
     private fun _initGl() {
@@ -176,6 +210,7 @@ class VideoPipeline {
         aPos = GLES20.glGetAttribLocation(program, "aPos")
         aTex = GLES20.glGetAttribLocation(program, "aTex")
         uTexMatrix = GLES20.glGetUniformLocation(program, "uTexMatrix")
+        uTexBounds = GLES20.glGetUniformLocation(program, "uTexBounds")
 
         val vbos = IntArray(2)
         GLES20.glGenBuffers(2, vbos, 0)
@@ -199,21 +234,32 @@ class VideoPipeline {
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
         surfaceTexture = SurfaceTexture(oesTex).also {
             if (videoW > 0 && videoH > 0) it.setDefaultBufferSize(videoW, videoH)
-            it.setOnFrameAvailableListener {
-                synchronized(lock) { frameAvailable = true; lock.notifyAll() }
-            }
         }
     }
 
     private fun _buildProgram(): Int {
-        val vs = _shader(GLES20.GL_VERTEX_SHADER, VERT)
-        val fs = _shader(GLES20.GL_FRAGMENT_SHADER, FRAG)
+        val precision = IntArray(1)
+        GLES20.glGetShaderPrecisionFormat(GLES20.GL_FRAGMENT_SHADER, GLES20.GL_HIGH_FLOAT,
+            IntArray(2), 0, precision, 0)
+        // At 1920px, mediump texture coordinates can round across a one-texel crop boundary.
+        // Use the same qualifier at both ends of the varying, with an ES2 fallback.
+        val coordinatePrecision = if (precision[0] > 0) "highp" else "mediump"
+        Log.i(TAG, "Video texture coordinate precision: $coordinatePrecision (${precision[0]} bits)")
+        val vs = _shader(GLES20.GL_VERTEX_SHADER, VERT.replace("TEX_PRECISION", coordinatePrecision))
+        val fs = _shader(GLES20.GL_FRAGMENT_SHADER, FRAG.replace("TEX_PRECISION", coordinatePrecision))
         return GLES20.glCreateProgram().also {
             GLES20.glAttachShader(it, vs)
             GLES20.glAttachShader(it, fs)
             GLES20.glLinkProgram(it)
             GLES20.glDeleteShader(vs)
             GLES20.glDeleteShader(fs)
+            val linked = IntArray(1)
+            GLES20.glGetProgramiv(it, GLES20.GL_LINK_STATUS, linked, 0)
+            if (linked[0] == 0) {
+                val message = GLES20.glGetProgramInfoLog(it)
+                GLES20.glDeleteProgram(it)
+                error("Video shader link failed: $message")
+            }
         }
     }
 
@@ -228,6 +274,12 @@ class VideoPipeline {
     }
 
     private fun _releaseGl() {
+        surfaceTexture?.setOnFrameAvailableListener(null)
+        frameEvents?.quitSafely()
+        frameEvents?.join()
+        frameEvents = null
+        lastTextureTimestamp = Long.MIN_VALUE
+        hasFrame = false
         surfaceTexture?.release()
         surfaceTexture = null
         inputSurface?.release()
@@ -259,7 +311,7 @@ class VideoPipeline {
             "attribute vec2 aPos;\n" +
             "attribute vec2 aTex;\n" +
             "uniform mat4 uTexMatrix;\n" +
-            "varying vec2 vTex;\n" +
+            "varying TEX_PRECISION vec2 vTex;\n" +
             "void main() {\n" +
             "  gl_Position = vec4(aPos, 0.0, 1.0);\n" +
             "  vTex = (uTexMatrix * vec4(aTex, 0.0, 1.0)).xy;\n" +
@@ -268,10 +320,11 @@ class VideoPipeline {
         private const val FRAG =
             "#extension GL_OES_EGL_image_external : require\n" +
             "precision mediump float;\n" +
-            "varying vec2 vTex;\n" +
+            "varying TEX_PRECISION vec2 vTex;\n" +
+            "uniform TEX_PRECISION vec4 uTexBounds;\n" +
             "uniform samplerExternalOES sTex;\n" +
             "void main() {\n" +
-            "  gl_FragColor = texture2D(sTex, vTex);\n" +
+            "  gl_FragColor = texture2D(sTex, clamp(vTex, uTexBounds.xy, uTexBounds.zw));\n" +
             "}\n"
     }
 }

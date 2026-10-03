@@ -461,10 +461,17 @@
             android:letterSpacing="0.4"
             android:paddingHorizontal="24dp"
             android:paddingVertical="12dp"
-            android:text="1234"
             android:textColor="@color/tv_accent"
             android:textSize="42sp"
             android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:text="@string/pin_dismiss_hint"
+            android:textColor="@color/tv_text_secondary"
+            android:textSize="16sp" />
 
     </LinearLayout>
 
@@ -839,7 +846,7 @@
                                 android:layout_width="wrap_content"
                                 android:layout_height="wrap_content"
                                 android:layout_marginTop="2dp"
-                                android:text="Require 4-digit code on TV to pair"
+                                android:text="@string/pin_pairing_description"
                                 android:textColor="@color/tv_text_secondary"
                                 android:textSize="12sp" />
 
@@ -853,6 +860,14 @@
                             android:focusable="false" />
 
                     </LinearLayout>
+
+                    <Button
+                        android:id="@+id/buttonForgetDevices"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="10dp"
+                        android:text="@string/forget_devices"
+                        android:focusable="true" />
 
                 </LinearLayout>
 

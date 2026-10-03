@@ -47,9 +47,9 @@ typedef struct {
 
 static void _log_callback(void *cls, int level, const char *msg) {
     int prio = ANDROID_LOG_DEBUG;
-    if (level >= 5) prio = ANDROID_LOG_ERROR;
-    else if (level >= 4) prio = ANDROID_LOG_WARN;
-    else if (level >= 3) prio = ANDROID_LOG_INFO;
+    if (level <= LOGGER_ERR) prio = ANDROID_LOG_ERROR;
+    else if (level == LOGGER_WARNING) prio = ANDROID_LOG_WARN;
+    else if (level <= LOGGER_INFO) prio = ANDROID_LOG_INFO;
     __android_log_print(prio, TAG, "%s", msg);
 }
 
@@ -80,7 +80,7 @@ Java_com_flymop_airplaytv_bridge_NativeBridge_nativeInit(
     }
     ctx->cb_ctx.raop = ctx->raop;
 
-    raop_set_log_level(ctx->raop, LOGGER_ERR);
+    raop_set_log_level(ctx->raop, LOGGER_NOTICE);
     raop_set_log_callback(ctx->raop, _log_callback, NULL);
 
     const char *keyfile_c = env->GetStringUTFChars(keyFile, NULL);
@@ -98,13 +98,8 @@ Java_com_flymop_airplaytv_bridge_NativeBridge_nativeInit(
     }
 
     if (requirePin) {
-        /* avoid UxPlay's random-PIN retry path: use one random PIN for this server run */
-        int pin = random_pin();
-        if (pin < 0) {
-            LOGE("Failed to generate random pin");
-            pin = 1234;
-        }
-        raop_set_plist(ctx->raop, "pin", pin + 10000);
+        /* The hardened pair-pin-start handler opens a short-lived PIN pairing window. */
+        raop_set_plist(ctx->raop, "pin", 0);
     }
 
     /* shim dnssd_init only builds txt records; kotlin does the actual nsd registration */

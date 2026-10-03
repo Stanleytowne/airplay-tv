@@ -14,3 +14,9 @@ app/.cxx/
 build/
 .vscode/
 screenshot*.png
+*.keystore
+*.jks
+*.p12
+signing.properties
+__pycache__/
+*.pyc

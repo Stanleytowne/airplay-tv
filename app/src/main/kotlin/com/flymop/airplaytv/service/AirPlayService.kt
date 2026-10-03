@@ -57,7 +57,8 @@ import com.flymop.airplaytv.renderer.AirPlayVideoPlayer
 import com.flymop.airplaytv.renderer.AudioRenderer
 import com.flymop.airplaytv.renderer.VideoRenderer
 import com.flymop.airplaytv.viewmodel.DebugInfo
-import java.net.NetworkInterface
+import java.io.FileDescriptor
+import java.io.PrintWriter
 import java.security.SecureRandom
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -76,6 +77,20 @@ data class VideoPlaybackInfo(
 )
 
 class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
+
+    private val trustedClients by lazy { TrustedClients(this) }
+
+    override fun onRegisterClient(publicKey: String) {
+        trustedClients.remember(publicKey)
+        _mainHandler.post { clearPin() }
+    }
+
+    override fun onCheckClient(publicKey: String): Boolean = trustedClients.contains(publicKey)
+
+    fun forgetPairedDevices() {
+        trustedClients.clear()
+        restartServer()
+    }
 
     private var nativeHandle = 0L
     private var nsdManager: NsdServiceManager? = null
@@ -670,7 +685,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         airPlayVideoPlayer.play(location, startPositionSeconds)
         // claim media-button routing for keys that arrive as media-session events
         mediaSession?.isActive = true
-        log("AirPlay Video play: $location @ ${startPositionSeconds}s")
+        log("AirPlay Video playback started")
     }
 
     override fun onVideoScrub(positionSeconds: Float) {
@@ -978,6 +993,9 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         _mainHandler.post { dacpPlayer.refresh() }
     }
 
+    /** Close the prompt without stopping the receiver or interrupting playback. */
+    fun dismissPinPrompt() = clearPin()
+
     private fun clearPin() {
         _lastPin = null
         _activeRemotePin.value = null
@@ -985,12 +1003,23 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         _updateMediaNotification()
     }
 
+    override fun dump(fd: FileDescriptor, writer: PrintWriter, args: Array<out String>?) {
+        // Local ADB diagnostics only: no media content, PINs or paired keys.
+        writer.println("AirPlay performance")
+        writer.println("state=${_serverState.value} mirroring=${_mirroringActive.value}")
+        writer.println("video receiveFps=${videoRenderer.receivedFps} renderFps=${videoRenderer.fps} " +
+            "received=${videoRenderer.frameCount} rendered=${videoRenderer.renderedFrames} " +
+            "inputDrops=${videoRenderer.droppedFrames} jitterUs=${videoRenderer.framePacingJitterUs} " +
+            "bitrateBps=${videoRenderer.bitrateBps} codec=${videoRenderer.codecName}")
+        writer.println("audio ${audioRenderer.audioDebug()}")
+    }
+
     fun collectDebugInfo() = DebugInfo(
         videoCodec = videoRenderer.codecName,
         videoRes = _videoResolution.value,
         videoFps = videoRenderer.fps,
         videoBitrate = videoRenderer.bitrateBps,
-        videoFrames = videoRenderer.frameCount,
+        videoFrames = videoRenderer.renderedFrames,
         droppedFrames = videoRenderer.droppedFrames,
         framePacingJitterUs = videoRenderer.framePacingJitterUs,
         audioCodec = audioRenderer.codecLabel,
@@ -1003,21 +1032,9 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
     // helpers
 
     private fun getHwAddr(): ByteArray {
-        try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-            for (iface in interfaces) {
-                if (iface.name.startsWith("wlan") || iface.name.startsWith("eth")) {
-                    val mac = iface.hardwareAddress
-                    if (isUsableMac(mac)) return mac!!
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to get hardware address", e)
-        }
-
-        // fall back to stable per-install random address
-        return persistedRandomMac()
-            ?: byteArrayOf(0xAA.toByte(), 0xBB.toByte(), 0xCC.toByte(), 0xDD.toByte(), 0xEE.toByte(), 0xFF.toByte())
+        // A receiver identity, not the Wi-Fi interface address: the TV's built-in
+        // AirPlay receiver can advertise that physical address at the same time.
+        return checkNotNull(persistedRandomMac()) { "Unable to persist receiver identity" }
     }
 
     private fun isUsableMac(mac: ByteArray?): Boolean =
@@ -1031,8 +1048,9 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         repeat(10) {
             val mac = randomAaiMac()
             if (isUsableMac(mac)) {
-                prefs.edit().putString(Prefs.FALLBACK_MAC_ADDRESS, macToString(mac)).apply()
-                return mac
+                if (prefs.edit().putString(Prefs.FALLBACK_MAC_ADDRESS, macToString(mac)).commit()) {
+                    return mac
+                }
             }
         }
         return null
@@ -1048,7 +1066,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
     private fun macToString(mac: ByteArray): String = mac.joinToString(":") { "%02x".format(it) }
 
     private fun macFromString(s: String?): ByteArray? {
-        if (s == null) return null
+        if (s == null || !s.matches(Regex("[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}"))) return null
         return try {
             s.split(":").map { it.toInt(16).toByte() }.toByteArray()
         } catch (e: Exception) { null }

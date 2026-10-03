@@ -1,5 +1,8 @@
 <resources>
-    <string name="app_name">AirPlay TV</string>
+    <string name="app_name">AirPlay TV Home</string>
+    <string name="pin_pairing_description">Enter the TV code once; paired devices are remembered</string>
+    <string name="forget_devices">Forget paired devices</string>
+    <string name="forget_devices_message">Disconnect and require a new PIN from every device?</string>
     <string name="ready_to_connect">Ready to Connect</string>
     <string name="connect_instruction">Select this device in Screen Mirroring or AirPlay on your iPhone, iPad, or Mac.</string>
     <string name="server_name_label">Device Name:</string>
@@ -13,6 +16,7 @@
     <string name="step_3_desc">Choose this device to start streaming instantly</string>
     <string name="status_broadcasting">Ready to Cast • Bonjour Active</string>
     <string name="pin_code_title">AirPlay Security PIN</string>
+    <string name="pin_dismiss_hint">按遥控器返回键关闭</string>
     <string name="settings_title">Settings</string>
     <string name="low_latency">Low Latency Mode</string>
     <string name="show_hud">Show Performance HUD</string>

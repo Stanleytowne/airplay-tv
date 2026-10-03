@@ -24,6 +24,8 @@ typedef struct {
     jmethodID on_conn_destroy;
     jmethodID on_conn_reset;
     jmethodID on_display_pin;
+    jmethodID on_register_client;
+    jmethodID on_check_client;
     jmethodID on_metadata;
     jmethodID on_coverart;
     jmethodID on_progress;
@@ -36,8 +38,6 @@ typedef struct {
     jmethodID on_video_session_poll;
     int h265_enabled;
     int require_pin;
-    char *registered_keys[16];
-    int registered_count;
     /* playback info snapshot pushed by kotlin, read on the native httpd thread */
     pthread_mutex_t playback_info_lock;
     double playback_position;

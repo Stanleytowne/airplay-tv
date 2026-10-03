@@ -5,6 +5,7 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.util.Log
+import java.util.concurrent.locks.LockSupport
 import android.view.Surface
 import com.flymop.airplaytv.renderer.DecoderSelector.Companion.videoCaps
 
@@ -16,6 +17,8 @@ class VideoRenderer(ctx: Context) {
     private var avcDecoder: MediaCodecInfo? = null
     private var hevcDecoder: MediaCodecInfo? = null
     private var maxFps = 0
+    private var advertisedWidth = 1920
+    private var advertisedHeight = 1080
     private var codec: MediaCodec? = null
     private var displaySurface: Surface? = null
     private var currentH265 = false
@@ -23,29 +26,27 @@ class VideoRenderer(ctx: Context) {
     private var videoHeight = 0
     private var firstFrameQueued = false
 
-    // stats
-    @Volatile var fps = 0; private set
+    private var outputWorker: OutputWorker? = null
+    @Volatile private var outputFailure: Exception? = null
+
+    // Receive rate and display submissions are deliberately separate.
+    val fps: Int get() = pipeline.renderStats.snapshot(System.nanoTime()).fps
+    val renderedFrames: Long get() = pipeline.renderStats.snapshot(System.nanoTime()).frames
+    @Volatile var receivedFps = 0; private set
     @Volatile var bitrateBps = 0L; private set
     @Volatile var frameCount = 0L; private set
     @Volatile var codecName = ""; private set
     @Volatile var droppedFrames = 0L; private set
-    @Volatile var framePacingJitterUs = 0L; private set
+    val framePacingJitterUs: Long get() = pipeline.renderStats.snapshot(System.nanoTime()).jitterUs
 
     var enforceSdr = true
     var keyAllowFrameDrop = true
-    var scheduledOutputBufferRelease = true
+    @Volatile var scheduledOutputBufferRelease = true
     var benchmarkLog = false
     var benchmarkLogCallback: ((String) -> Unit)? = null
     private var _framesThisSec = 0
     private var _bytesThisSec = 0L
     private var _lastStatReset = 0L
-    private val _frameIntervalsNs = LongArray(120)
-    private var _frameIntervalIdx = 0
-    private var _frameIntervalCount = 0
-    private var _lastOutputFrameNs = 0L
-    // anchors that map decoder PTS (us) to System.nanoTime() for scheduled rendering
-    private var _ptsBaseUs = Long.MIN_VALUE
-    private var _wallBaseNs = 0L
 
     fun setResolution(w: Int, h: Int) {
         videoWidth = w
@@ -69,6 +70,8 @@ class VideoRenderer(ctx: Context) {
         avcDecoder = selector.avc()
         hevcDecoder = if (h265) selector.hevc(avcDecoder, w, h, fps) else null
         maxFps = fps
+        advertisedWidth = w
+        advertisedHeight = h
         Log.i(TAG, "decoders: avc=${avcDecoder?.name} hevc=${hevcDecoder?.name}")
         hevcDecoder != null
     }
@@ -88,17 +91,18 @@ class VideoRenderer(ctx: Context) {
     fun stopSession() = synchronized(lock) { stopCodec() }
 
     private fun _resetStats() {
-        fps = 0; bitrateBps = 0; frameCount = 0; codecName = ""
-        droppedFrames = 0; framePacingJitterUs = 0
+        receivedFps = 0; bitrateBps = 0; frameCount = 0; codecName = ""
+        droppedFrames = 0
+        pipeline.renderStats.reset()
+        _lastStatReset = System.nanoTime()
         _framesThisSec = 0; _bytesThisSec = 0
     }
 
     private fun _updateStats(size: Int) {
-        val now = System.currentTimeMillis()
-        if (now - _lastStatReset >= 1000) {
-            fps = _framesThisSec
-            bitrateBps = _bytesThisSec * 8
-            framePacingJitterUs = _computeFramePacingJitterUs()
+        val now = System.nanoTime()
+        if (now - _lastStatReset >= 1_000_000_000L) {
+            receivedFps = (_framesThisSec * 1_000_000_000L / (now - _lastStatReset)).toInt()
+            bitrateBps = _bytesThisSec * 8 * 1_000_000_000L / (now - _lastStatReset)
             _framesThisSec = 0
             _bytesThisSec = 0
             _lastStatReset = now
@@ -110,7 +114,7 @@ class VideoRenderer(ctx: Context) {
     }
 
     private fun _emitBenchmarkLine() {
-        val msg = "fps=$fps bitrate=${bitrateBps / 1000}kbps " +
+        val msg = "renderFps=$fps receiveFps=$receivedFps bitrate=${bitrateBps / 1000}kbps " +
             "jitter=${framePacingJitterUs}us frames=$frameCount " +
             "dropped=$droppedFrames codec=$codecName " +
             "res=${videoWidth}x${videoHeight}"
@@ -123,7 +127,7 @@ class VideoRenderer(ctx: Context) {
             _updateStats(data.size)
             if (videoWidth == 0 || videoHeight == 0) return
 
-            if (codec == null || isH265 != currentH265) {
+            if (codec == null || isH265 != currentH265 || outputFailure != null) {
                 // a stale reference frame decodes to corruption, so wait for a keyframe to (re)start
                 if (!_isKeyframe(data, isH265)) {
                     if (codec != null) stopCodec()
@@ -135,7 +139,6 @@ class VideoRenderer(ctx: Context) {
             try {
                 if (codec == null) startCodec(isH265)
                 _feedToCodec(data, ntpTimeNs)
-                drainOutput()
             } catch (e: Exception) {
                 Log.w(TAG, "Codec error, resetting", e)
                 stopCodec()
@@ -157,7 +160,6 @@ class VideoRenderer(ctx: Context) {
                 firstFrameQueued = true
                 return
             }
-            drainOutput()
         }
         droppedFrames++
         Log.w(TAG, "Decoder input queue full; dropping frame. drops=$droppedFrames")
@@ -194,6 +196,7 @@ class VideoRenderer(ctx: Context) {
     private fun startCodec(h265: Boolean) {
         pipeline.start()
         pipeline.setVideoSize(videoWidth, videoHeight)
+        pipeline.setDecodedSize(videoWidth, videoHeight)
         val s = pipeline.inputSurface ?: return
         currentH265 = h265
         val mime = if (h265) DecoderSelector.HEVC else DecoderSelector.AVC
@@ -230,8 +233,14 @@ class VideoRenderer(ctx: Context) {
     private fun _format(mime: String, info: MediaCodecInfo) = MediaFormat.createVideoFormat(mime, videoWidth, videoHeight).apply {
         setInteger(MediaFormat.KEY_FRAME_RATE, maxFps)
         if (selector.adaptive(info, mime)) {
-            setInteger(MediaFormat.KEY_MAX_WIDTH, videoWidth)
-            setInteger(MediaFormat.KEY_MAX_HEIGHT, videoHeight)
+            // The first picture can be the portrait Control Center. Reserve the
+            // advertised landscape size too, before the sender rotates into video.
+            val caps = info.videoCaps(mime)
+            val maxW = maxOf(videoWidth, advertisedWidth).coerceAtMost(caps.supportedWidths.upper)
+            val maxH = maxOf(videoHeight, advertisedHeight).coerceAtMost(caps.supportedHeights.upper)
+            setInteger(MediaFormat.KEY_MAX_WIDTH, maxW)
+            setInteger(MediaFormat.KEY_MAX_HEIGHT, maxH)
+            Log.i(TAG, "Adaptive decoder bounds: ${maxW}x${maxH}; initial ${videoWidth}x${videoHeight}")
         }
         setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, maxOf(videoWidth * videoHeight * 3 / 4, 1024 * 1024))
         if (enforceSdr) {
@@ -253,15 +262,15 @@ class VideoRenderer(ctx: Context) {
             throw e
         }
         codec = c
+        outputFailure = null
+        outputWorker = OutputWorker(c).also { it.start() }
         codecName = (if (h265) "H.265" else "H.264") + " (${c.name})"
     }
 
     private fun stopCodec() {
-        _frameIntervalIdx = 0
-        _frameIntervalCount = 0
-        _lastOutputFrameNs = 0L
-        _ptsBaseUs = Long.MIN_VALUE
-        _wallBaseNs = 0L
+        outputWorker?.stopAndJoin()
+        outputWorker = null
+        outputFailure = null
         codec?.let {
             try {
                 it.stop()
@@ -271,23 +280,53 @@ class VideoRenderer(ctx: Context) {
         codec = null
     }
 
-    private fun drainOutput() {
-        val c = codec ?: return
-        val info = MediaCodec.BufferInfo()
-        while (true) {
-            val idx = c.dequeueOutputBuffer(info, 0)
-            if (idx < 0) break
-            _recordOutputFrameTime()
-            if (scheduledOutputBufferRelease) {
-                // schedule frame at VSYNC matching its NTP presentation time
-                val ptsUs = info.presentationTimeUs
-                if (_ptsBaseUs == Long.MIN_VALUE) {
-                    _ptsBaseUs = ptsUs
-                    _wallBaseNs = System.nanoTime()
+    private inner class OutputWorker(private val decoder: MediaCodec) {
+        @Volatile private var running = true
+        private val thread = Thread({ run() }, "VideoDecodeOutput")
+        private val pacer = FramePacer()
+
+        fun start() = thread.start()
+
+        fun stopAndJoin() {
+            running = false
+            LockSupport.unpark(thread)
+            thread.join()
+        }
+
+        private fun run() {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY)
+            val info = MediaCodec.BufferInfo()
+            try {
+                while (running) {
+                    val index = decoder.dequeueOutputBuffer(info, 10_000L)
+                    if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        val format = decoder.outputFormat
+                        pipeline.setDecodedSize(format.getInteger(MediaFormat.KEY_WIDTH),
+                            format.getInteger(MediaFormat.KEY_HEIGHT))
+                        continue
+                    }
+                    if (index < 0) continue
+                    if (!running) {
+                        decoder.releaseOutputBuffer(index, false)
+                        break
+                    }
+                    if (scheduledOutputBufferRelease) {
+                        val target = pacer.releaseTimeNs(info.presentationTimeUs, System.nanoTime())
+                        // SurfaceTexture consumers may ignore codec presentation deadlines.
+                        // Pace here as well, without blocking the network/input thread.
+                        while (running) {
+                            val remaining = target - System.nanoTime()
+                            if (remaining <= 0) break
+                            LockSupport.parkNanos(minOf(remaining, 10_000_000L))
+                        }
+                    }
+                    decoder.releaseOutputBuffer(index, running)
                 }
-                c.releaseOutputBuffer(idx, _wallBaseNs + (ptsUs - _ptsBaseUs) * 1000L)
-            } else {
-                c.releaseOutputBuffer(idx, true)
+            } catch (e: Exception) {
+                if (running) {
+                    outputFailure = e
+                    Log.w(TAG, "Video output failed", e)
+                }
             }
         }
     }
@@ -296,32 +335,6 @@ class VideoRenderer(ctx: Context) {
         stopCodec()
         pipeline.release()
         _resetStats()
-    }
-
-    private fun _recordOutputFrameTime() {
-        val now = System.nanoTime()
-        if (_lastOutputFrameNs > 0) {
-            _frameIntervalsNs[_frameIntervalIdx % _frameIntervalsNs.size] = now - _lastOutputFrameNs
-            _frameIntervalIdx++
-            _frameIntervalCount++
-        }
-        _lastOutputFrameNs = now
-    }
-
-    private fun _computeFramePacingJitterUs(): Long {
-        val count = _frameIntervalCount.coerceAtMost(_frameIntervalsNs.size)
-        if (count < 2) return 0
-
-        var sum = 0.0
-        var sumSq = 0.0
-        for (i in 0 until count) {
-            val interval = _frameIntervalsNs[i].toDouble()
-            sum += interval
-            sumSq += interval * interval
-        }
-        val mean = sum / count
-        val variance = (sumSq / count) - (mean * mean)
-        return (kotlin.math.sqrt(variance.coerceAtLeast(0.0)) / 1000.0).toLong()
     }
 
     companion object {

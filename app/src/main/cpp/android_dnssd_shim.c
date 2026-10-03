@@ -11,6 +11,7 @@
 #include "dnssdint.h"
 #include "global.h"
 #include "utils.h"
+#include "airplay_identity.h"
 
 #define MAX_SERVNAME 256
 #define MAX_TXT_ENTRIES 32
@@ -166,7 +167,9 @@ dnssd_register_airplay(dnssd_t *dnssd, unsigned short port)
     if (dnssd->pk) {
         _txt_set(rec, "pk", dnssd->pk);
     }
-    _txt_set(rec, "pi", AIRPLAY_PI);
+    char receiver_uuid[37];
+    airplay_receiver_uuid(dnssd->hw_addr, dnssd->hw_addr_len, receiver_uuid);
+    _txt_set(rec, "pi", receiver_uuid);
     _txt_set(rec, "srcvers", AIRPLAY_SRCVERS);
     _txt_set(rec, "vv", AIRPLAY_VV);
     return 0;

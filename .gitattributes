@@ -1,0 +1,2 @@
+# Vendor patches retain upstream context, including its existing whitespace.
+*.patch -whitespace

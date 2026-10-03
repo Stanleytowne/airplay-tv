@@ -48,6 +48,21 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      - name: Restore private release signing configuration
+        env:
+          AIRPLAY_KEYSTORE_B64: ${{ secrets.AIRPLAY_KEYSTORE_B64 }}
+          AIRPLAY_STORE_PASSWORD: ${{ secrets.AIRPLAY_STORE_PASSWORD }}
+          AIRPLAY_KEY_ALIAS: ${{ secrets.AIRPLAY_KEY_ALIAS }}
+          AIRPLAY_KEY_PASSWORD: ${{ secrets.AIRPLAY_KEY_PASSWORD }}
+        run: python3 tools/prepare_ci_signing.py
+
+      - name: Native security regressions
+        env:
+          OPENSSL_PREFIX: /usr
+        run: |
+          ./gradlew applyUxplayPatches --no-daemon
+          python3 tests/run_native_security.py
+
       - name: Build Release APK
         run: ./gradlew assembleRelease --no-daemon
 

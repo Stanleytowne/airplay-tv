@@ -127,7 +127,11 @@ public:
 
     // reset clock base after discontinuity or clock shift/resync so it doesn't poison
     // jitter calculations; producer-thread only (same as observe())
-    void reanchor() { mHaveBase = false; }
+    void reanchor() {
+        mHaveBase = false;
+        std::fill_n(mHist, NBUCKETS, 0);
+        mTuned.store(mFloor, std::memory_order_relaxed);
+    }
 
     // latest tuned cushion in samples; any thread
     size_t target() const { return mTuned.load(std::memory_order_relaxed); }
@@ -144,8 +148,8 @@ private:
         return (size_t)sampleRate * ms / 1000 * channels;
     }
 
-    static constexpr int MIN_CUSHION_MS = 0;             // algorithm already enforces effective floor
-    static constexpr int MAX_CUSHION_MS = 1000;
+    static constexpr int MIN_CUSHION_MS = 40;            // absorb Wi-Fi/scheduler jitter before the first underrun
+    static constexpr int MAX_CUSHION_MS = 200;
     static constexpr int BUCKET_MS = 5;                  // histogram granularity
     static constexpr int NBUCKETS = MAX_CUSHION_MS / BUCKET_MS;
     static constexpr int64_t BUCKET_NS = (int64_t)BUCKET_MS * 1000000LL;
